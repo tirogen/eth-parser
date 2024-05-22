@@ -1,17 +1,13 @@
 package ethparser
 
 import (
-	"bufio"
 	"bytes"
 	"context"
-	"crypto/tls"
 	"encoding/json"
-	"net"
+	"log"
 	"net/http"
-	"net/url"
 	"strconv"
 	"sync/atomic"
-	"time"
 )
 
 type Parser interface {
@@ -25,75 +21,68 @@ type Parser interface {
 	GetTransactions(address string) []Transaction
 }
 
-type Transaction struct {
-	BlockNumber *string `json:"blockNumber,omitempty"`
-	BlockHash   *string `json:"blockHash,omitempty"`
-	From        *string `json:"from,omitempty"`
-	Nonce       string  `json:"nonce"`
-	GasPrice    *string `json:"gasPrice,omitempty"`
-	GasTipCap   *string `json:"gasTipCap,omitempty"`
-	GasFeeCap   *string `json:"gasFeeCap,omitempty"`
-	Gas         uint64  `json:"gas"`
-	To          *string `json:"to,omitempty"`
-}
-
 type ethParser struct {
-	httpProvider string
-	wssProvider  string
-	client       *http.Client
-	idCounter    atomic.Uint32
-	transactions map[string][]Transaction
+	httpProvider      string
+	wssProvider       string
+	client            *http.Client
+	idCounter         atomic.Uint32
+	subscribedAddress map[string]bool
+	websocketConnect  WebSocketConnect
+	database          Database
 }
 
 type Config struct {
-	HTTPProvider        string
-	WSSProvider         string
-	MaxIdleConns        int
-	IdleConnTimeout     time.Duration
-	TLSHandshakeTimeout time.Duration
-	Timeout             time.Duration
+	HTTPProvider string
+	WSSProvider  string
+	Client       *http.Client
+	MaxInboxSize int
 }
 
 func New(ctx context.Context, c *Config) (Parser, error) {
-	transport := &http.Transport{
-		MaxIdleConns:        c.MaxIdleConns,
-		IdleConnTimeout:     c.IdleConnTimeout,
-		TLSHandshakeTimeout: c.TLSHandshakeTimeout,
-	}
-	client := &http.Client{
-		Transport: transport,
-		Timeout:   c.Timeout,
-	}
-	parser := &ethParser{
-		httpProvider: c.HTTPProvider,
-		wssProvider:  c.WSSProvider,
-		client:       client,
-		idCounter:    atomic.Uint32{},
-		transactions: map[string][]Transaction{},
-	}
-	if err := parser.backgroundProcess(ctx); err != nil {
+	websocketConnect, err := NewWebSocketConnect(c.WSSProvider, c.MaxInboxSize)
+	if err != nil {
 		return nil, err
 	}
+	database := NewDatabase()
+	parser := &ethParser{
+		httpProvider:      c.HTTPProvider,
+		wssProvider:       c.WSSProvider,
+		client:            c.Client,
+		idCounter:         atomic.Uint32{},
+		subscribedAddress: make(map[string]bool),
+		websocketConnect:  websocketConnect,
+		database:          database,
+	}
+	go func() {
+		if err := parser.backgroundProcess(ctx); err != nil {
+			log.Printf("background process failed: %v", err)
+		}
+	}()
 	return parser, nil
 }
 
-type BlockNumberRequest struct {
-	Method  string `json:"method"`
-	Params  []any  `json:"params"`
-	ID      uint32 `json:"id"`
-	JsonRPC string `json:"jsonrpc"`
-}
-
-type BlockNumberResponse struct {
-	Result  string `json:"result"`
-	ID      uint32 `json:"id"`
-	JsonRPC string `json:"jsonrpc"`
+func NewWithWebSocketConnect(ctx context.Context, c *Config, websocketConnect WebSocketConnect, subscribedAddress map[string]bool) (Parser, error) {
+	database := NewDatabase()
+	parser := &ethParser{
+		httpProvider:      c.HTTPProvider,
+		wssProvider:       c.WSSProvider,
+		client:            c.Client,
+		idCounter:         atomic.Uint32{},
+		subscribedAddress: subscribedAddress,
+		websocketConnect:  websocketConnect,
+		database:          database,
+	}
+	go func() {
+		if err := parser.backgroundProcess(ctx); err != nil {
+			log.Printf("background process failed: %v", err)
+		}
+	}()
+	return parser, nil
 }
 
 func (p *ethParser) GetCurrentBlock() int {
-	payload := BlockNumberRequest{
+	payload := EthRequest{
 		Method:  "eth_blockNumber",
-		Params:  []any{},
 		ID:      p.nextID(),
 		JsonRPC: "2.0",
 	}
@@ -132,73 +121,81 @@ func (p *ethParser) GetCurrentBlock() int {
 }
 
 func (p *ethParser) Subscribe(address string) bool {
-	p.transactions[address] = []Transaction{}
+	p.subscribedAddress[address] = true
 	return true
 }
 
 func (p *ethParser) GetTransactions(address string) []Transaction {
-	return p.transactions[address]
+	return p.database.GetTransactions(address)
 }
 
 func (p *ethParser) nextID() uint32 {
 	return p.idCounter.Add(1)
 }
 
+// internal methods for getting transaction by hash which is used in background process
+func (p *ethParser) getTransactionByHash(ctx context.Context, hash string) (*Transaction, error) {
+	payload := EthRequest{
+		Method:  "eth_getTransactionByHash",
+		Params:  []string{hash},
+		ID:      p.nextID(),
+		JsonRPC: "2.0",
+	}
+
+	jsonPayload, err := json.Marshal(payload)
+	if err != nil {
+		return nil, ErrFailedToParseJSON
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "POST", p.httpProvider, bytes.NewBuffer(jsonPayload))
+	if err != nil {
+		return nil, ErrFailedToCreateRequest
+	}
+
+	resp, err := p.client.Do(req)
+	if err != nil {
+		return nil, ErrRequestFailed
+	}
+	defer resp.Body.Close()
+
+	var transactionByHash TransactionByHashResponse
+	if err := json.NewDecoder(resp.Body).Decode(&transactionByHash); err != nil {
+		return nil, ErrFailedToParseJSON
+	}
+
+	return transactionByHash.Result, nil
+}
+
 func (p *ethParser) backgroundProcess(ctx context.Context) error {
-	u, err := url.Parse(p.wssProvider)
+	method := `{"id":1,"jsonrpc":"2.0","method":"eth_subscribe","params":["newPendingTransactions"]}`
+	outCh, err := p.websocketConnect.Subscribe(ctx, method)
 	if err != nil {
-		return ErrInvalidAddress
+		return err
 	}
 
-	conn, err := net.Dial("tcp", u.Host)
-	if err != nil {
-		return ErrDialFailed
+	for message := range outCh {
+		var result SubscribeTransactionResult
+		if err := json.Unmarshal([]byte(message), &result); err != nil {
+			log.Printf("failed to unmarshal message: %v", err)
+			continue
+		}
+		// can skip first message which return subscription id
+		if result.Params != nil {
+			transaction, err := p.getTransactionByHash(ctx, result.Params.Result)
+			if err != nil {
+				log.Printf("failed to get transaction by hash: %v", err)
+				continue
+			}
+			if _, ok := p.subscribedAddress[transaction.From]; ok {
+				p.database.AddTransaction(transaction.From, *transaction)
+			}
+			if transaction.To != nil {
+				if _, ok := p.subscribedAddress[*transaction.To]; ok {
+					p.database.AddTransaction(*transaction.To, *transaction)
+				}
+			}
+		}
 	}
-
-	// Upgrade to TLS if necessary
-	if u.Scheme == "wss" {
-		conn = tls.Client(conn, &tls.Config{
-			InsecureSkipVerify: true,
-		})
-	}
-
-	// Form the HTTP request for WebSocket handshake
-	requestHeader := http.Header{
-		"Connection":            {"Upgrade"},
-		"Upgrade":               {"websocket"},
-		"Sec-WebSocket-Version": {"13"},
-		"Sec-WebSocket-Key":     {"dGhlIHNhbXBsZSBub25jZQ=="},
-	}
-
-	req := http.Request{
-		Method: "GET",
-		URL:    u,
-		Host:   u.Host,
-		Header: requestHeader,
-	}
-
-	if err = req.Write(conn); err != nil {
-		return ErrWriteMessageFailed
-	}
-
-	// Read the response from the server
-	resp, err := http.ReadResponse(bufio.NewReader(conn), &req)
-	if err != nil {
-		return ErrResultIsUnexpected
-	}
-
-	if resp.StatusCode != http.StatusSwitchingProtocols {
-		return ErrUnexpectedStatusCode
-	}
-
-	// for {
-	// 	select {
-	// 	case <-ctx.Done():
-	// 		return
-	// 	default:
-
-	// 	}
-	// }
 
 	return nil
 }
