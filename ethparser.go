@@ -131,6 +131,13 @@ func (p *ethParser) Subscribe(address string) bool {
 	return true
 }
 
+func (p *ethParser) isSubscribed(address string) bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	_, ok := p.subscribedAddress[address]
+	return ok
+}
+
 func (p *ethParser) GetTransactions(address string) []Transaction {
 	return p.database.GetTransactions(address)
 }
@@ -192,11 +199,11 @@ func (p *ethParser) backgroundProcess(ctx context.Context) error {
 				log.Printf("failed to get transaction by hash: %v", err)
 				continue
 			}
-			if _, ok := p.subscribedAddress[transaction.From]; ok {
+			if p.isSubscribed(transaction.From) {
 				p.database.AddTransaction(transaction.From, *transaction)
 			}
 			if transaction.To != nil {
-				if _, ok := p.subscribedAddress[*transaction.To]; ok {
+				if p.isSubscribed(*transaction.To) {
 					p.database.AddTransaction(*transaction.To, *transaction)
 				}
 			}
