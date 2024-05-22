@@ -8,30 +8,32 @@ Package `ethparser` uses to subscribe transactions from provided address
 package main
 
 import (
+	"context"
 	"log"
+	"net/http"
+
 	"github.com/tirogen/ethparser"
 )
 
 func main() {
-    client, err := ethparser.New(context.TODO(), &Config{
+	client, err := ethparser.New(context.TODO(), &ethparser.Config{
 		HTTPProvider: "https://cloudflare-eth.com",
 		WSSProvider:  "wss://ethereum-rpc.publicnode.com",
 		MaxInboxSize: 100,
 		Client:       http.DefaultClient,
 	})
-    if err != nil {
-        log.Fatal(err)
-    }
-    defer client.Close()
+	if err != nil {
+		log.Fatal(err)
+	}
 
-    // Subscribe to transactions
-    p.Subscribe("0x0000000000000000000000000000000000000002")
+	// Subscribe to transactions
+	client.Subscribe("0x0000000000000000000000000000000000000002")
 
-    // Get transactions
-    transactions := p.GetTransactions("0x0000000000000000000000000000000000000002")
-    for _, tx := range transactions {
-        log.Println(tx)
-    }
+	// Get transactions
+	transactions := client.GetTransactions("0x0000000000000000000000000000000000000002")
+	for _, tx := range transactions {
+		log.Println(tx)
+	}
 }
 ```
 
