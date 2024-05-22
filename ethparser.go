@@ -7,6 +7,7 @@ import (
 	"log"
 	"net/http"
 	"strconv"
+	"sync"
 	"sync/atomic"
 )
 
@@ -22,6 +23,7 @@ type Parser interface {
 }
 
 type ethParser struct {
+	mu                sync.RWMutex
 	httpProvider      string
 	wssProvider       string
 	client            *http.Client
@@ -45,6 +47,7 @@ func New(ctx context.Context, c *Config) (Parser, error) {
 	}
 	database := NewDatabase()
 	parser := &ethParser{
+		mu:                sync.RWMutex{},
 		httpProvider:      c.HTTPProvider,
 		wssProvider:       c.WSSProvider,
 		client:            c.Client,
@@ -64,6 +67,7 @@ func New(ctx context.Context, c *Config) (Parser, error) {
 func NewWithWebSocketConnect(ctx context.Context, c *Config, websocketConnect WebSocketConnect, subscribedAddress map[string]bool) (Parser, error) {
 	database := NewDatabase()
 	parser := &ethParser{
+		mu:                sync.RWMutex{},
 		httpProvider:      c.HTTPProvider,
 		wssProvider:       c.WSSProvider,
 		client:            c.Client,
@@ -121,6 +125,8 @@ func (p *ethParser) GetCurrentBlock() int {
 }
 
 func (p *ethParser) Subscribe(address string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	p.subscribedAddress[address] = true
 	return true
 }
